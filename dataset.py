@@ -3,6 +3,7 @@ import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import pandas as pd
 import torch
+import utils
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import pretty_midi
@@ -97,39 +98,6 @@ class MaestroFeatureOneHotDataset(Dataset):
             "ticks_per_beat": torch.tensor(pm.resolution, dtype=torch.long)  # scalar
         }
 
-def collate_onehot(batch):
-    """
-    Pads each field in the batch to shape (B, T_max, C) or (B, T_max)
-    """
-    B = len(batch)
-    Ls = [b["dt"].shape[0] for b in batch]
-    T = max(Ls)
-    out = {}
-
-    for key, tensor in batch[0].items():
-        if key == "ticks_per_beat":
-            # scalar: just return the first one
-            out[key] = tensor
-            continue
-        if tensor.dim() == 2:
-            # categorical one-hot: (L, C) -> (B, T, C)
-            _, C = tensor.shape
-            pad = torch.zeros(B, T, C, dtype=tensor.dtype)
-            for i, b in enumerate(batch):
-                L = b[key].shape[0]
-                pad[i, :L] = b[key]
-            out[key] = pad
-        else:
-            # continuous: (L,) -> (B, T)
-            pad = torch.zeros(B, T, dtype=tensor.dtype)
-            for i, b in enumerate(batch):
-                L = b[key].shape[0]
-                pad[i, :L] = b[key]
-            out[key] = pad
-
-    out["lengths"] = torch.tensor(Ls, dtype=torch.long)
-    return out
-
 # Example DataLoader
 if __name__ == "__main__":
     manifest = "maestro-v3.0.0/maestro-v3.0.0.csv"
@@ -137,7 +105,7 @@ if __name__ == "__main__":
     
     ds = MaestroFeatureOneHotDataset(manifest, midi_dir, time_bin=0.01)
     loader = DataLoader(ds, batch_size=4, shuffle=True,
-                        collate_fn=collate_onehot, num_workers=2)
+                        collate_fn=utils.collate_onehot, num_workers=2)
 
     batch = next(iter(loader))
     print({k: v.shape for k, v in batch.items()})  # inspect shapes

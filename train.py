@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from dataset import MaestroFeatureOneHotDataset, collate_onehot
+import utils
 from tqdm import tqdm
 # -------------------------
 # Model definitions
@@ -98,7 +99,7 @@ class TransformerModel(nn.Module):
 # -------------------------
 # Training loop
 # -------------------------
-def train_epoch(model, loader, optimizer, device):
+def train_epoch(model, loader, optimizer, device, epoch):
     model.train()
     ce = nn.CrossEntropyLoss()
     mse = nn.MSELoss()
@@ -150,12 +151,14 @@ def train_epoch(model, loader, optimizer, device):
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
+        break
     # Save model 
     torch.save(model.state_dict(), model_path)
     print(f"Model saved to {model_path} with loss {total_loss:.4f/ len(loader)}")
     
-    #Generate a sample output
-    #TODO:
+    utils.create_song(model, loader.dataset, device=device,
+                      output_path=f'generated_song_{epoch}.mid',
+                      max_length=10_000)
     
     return total_loss / len(loader)
 
@@ -205,7 +208,7 @@ def main():
 
     # Training
     for epoch in range(1, args.epochs+1):
-        loss = train_epoch(model, loader, optimizer, device)
+        loss = train_epoch(model, loader, optimizer, device, epoch)
         print(f"Epoch {epoch}/{args.epochs}  Loss: {loss:.4f}")
 
     # Save
