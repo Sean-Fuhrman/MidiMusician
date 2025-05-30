@@ -38,6 +38,9 @@ class LSTMModel(nn.Module):
         )  # [B, T, hidden_dim]
         # heads
         type_logits  = self.type_head(out)
+        #make start-token logits large negative
+        type_logits[:, :, 3] = -1e9  # start token
+        
         pitch_logits = self.pitch_head(out)
         ctrl_logits  = self.ctrl_head(out)
         dt_pred      = self.dt_head(out).squeeze(-1)
@@ -80,12 +83,13 @@ class TransformerModel(nn.Module):
         x_proj = self.input_fc(x)  # [B, T, d_model]
         out = self.transformer(x_proj, src_key_padding_mask=mask)
         type_logits  = self.type_head(out)
+        #make start-token logits large negative
+        type_logits[:, :, 3] = -1e9  # start token
         pitch_logits = self.pitch_head(out)
         ctrl_logits  = self.ctrl_head(out)
         dt_pred      = self.dt_head(out).squeeze(-1)
         dur_pred     = self.dur_head(out).squeeze(-1)
         val_pred     = self.val_head(out).squeeze(-1)
-        bpm_pred     = self.bpm_head(out).squeeze(-1)
         return {
             "type": type_logits,
             "pitch": pitch_logits,
@@ -93,7 +97,6 @@ class TransformerModel(nn.Module):
             "dt": dt_pred,
             "dur": dur_pred,
             "val": val_pred,
-            "bpm": bpm_pred
         }
 
 # -------------------------
@@ -104,15 +107,14 @@ def train_epoch(model, loader, optimizer, device, epoch):
     ce = nn.CrossEntropyLoss()
     mse = nn.MSELoss()
     total_loss = 0.0
-    model_path = 'model.pt'
-
-    for batch in tqdm(loader):
+    model_path = 'models/model.pt'
+    iterations = 0
+    for batch in tqdm(loader, desc=f"Epoch {epoch}"):
         # move to device
         for k in batch:
             batch[k] = batch[k].to(device)
         # prepare inputs & targets
         lengths = batch["lengths"] - 1
-        print(f"Batch lengths: {lengths}")
         x_inputs = torch.cat([
             batch["type_oh"][:,:-1],
             batch["pitch_oh"][:,:-1],
@@ -120,7 +122,6 @@ def train_epoch(model, loader, optimizer, device, epoch):
             batch["dt"][:,:-1].unsqueeze(-1),
             batch["dur"][:,:-1].unsqueeze(-1),
             batch["val"][:,:-1].unsqueeze(-1),
-            batch["bpm"][:,:-1].unsqueeze(-1),
         ], dim=2)  # [B, T-1, input_dim]
         # targets
         target_type  = batch["type_oh"][:,1:].argmax(dim=-1)
@@ -129,12 +130,9 @@ def train_epoch(model, loader, optimizer, device, epoch):
         target_dt    = batch["dt"][:,1:]
         target_dur   = batch["dur"][:,1:]
         target_val   = batch["val"][:,1:]
-        target_bpm   = batch["bpm"][:,1:]
-
 
         # forward
         preds = model(x_inputs, lengths)
-
 
         # compute losses
         loss_type  = ce(preds["type"].transpose(1,2), target_type)
@@ -143,22 +141,23 @@ def train_epoch(model, loader, optimizer, device, epoch):
         loss_dt    = mse(preds["dt"],  target_dt)
         loss_dur   = mse(preds["dur"], target_dur)
         loss_val   = mse(preds["val"], target_val)
-        loss_bpm   = mse(preds["bpm"], target_bpm)
 
         loss = (loss_type + loss_pitch + loss_ctrl +
-                loss_dt + loss_dur + loss_val + loss_bpm)
+                loss_dt + loss_dur + loss_val)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
-        break
+        iterations += 1
+
     # Save model 
     torch.save(model.state_dict(), model_path)
-    print(f"Model saved to {model_path} with loss {total_loss:.4f/ len(loader)}")
+    print(f"Model saved to {model_path} with loss {total_loss/ len(loader):.4f}")
     
     utils.create_song(model, loader.dataset, device=device,
                       output_path=f'generated_song_{epoch}.mid',
-                      max_length=10_000)
+                      max_steps=1_000)
+    model.train()  # reset model to train mode after saving
     
     return total_loss / len(loader)
 
@@ -168,7 +167,7 @@ def main():
     parser.add_argument('--midi_dir', type=str, default='maestro-v3.0.0/',)
     parser.add_argument('--model_type', choices=['lstm','transformer'], default='lstm')
     parser.add_argument('--batch_size', type=int, default=4)
-    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--hidden_dim', type=int, default=512)
     parser.add_argument('--num_layers', type=int, default=2)
@@ -186,7 +185,7 @@ def main():
     sample = next(iter(loader))
     B, T, _ = sample["type_oh"].shape
     input_dim = sample["type_oh"].shape[2] + sample["pitch_oh"].shape[2] + \
-                sample["ctrl_oh"].shape[2] + 4  # dt,dur,val,bpm
+                sample["ctrl_oh"].shape[2] + 3  # dt,dur,val
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -212,7 +211,7 @@ def main():
         print(f"Epoch {epoch}/{args.epochs}  Loss: {loss:.4f}")
 
     # Save
-    out_name = f"{args.model_type}_model.pt"
+    out_name = f"models/{args.model_type}_final_model.pt"
     torch.save(model.state_dict(), out_name)
     print(f"Saved model to {out_name}")
 

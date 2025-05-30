@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 import pretty_midi
 from mido import MidiFile, MidiTrack, Message, MetaMessage
-
+from tqdm import tqdm
 
 def midi_to_event_list(midi_data):
     """
@@ -14,26 +14,14 @@ def midi_to_event_list(midi_data):
     
       "note":           ["start_time","end_time","track","duration","channel","pitch","velocity"]
       "control_change": ["time","track", "value"]
-      "set_tempo":      ["time","track","bpm"]
-      "ticks_per_beat": ["ticks_per_beat"]
+      "start-token":      ["track","bpm", "resolution"]
+      "end-token":    []
     """
     events = []
     track_idx = 0  # MAESTRO is single-instrument, so one “track”
 
     inst = midi_data.instruments[0]
-
-
     
-    # 2) tempo changes
-    times, tempi = midi_data.get_tempo_changes()  # times in sec, tempi in µs per beat
-    for t, uspb in zip(times, tempi):
-        bpm = 60_000_000 / uspb
-        events.append({
-            "type":  "set_tempo",
-            "time": t,
-            "track": track_idx,
-            "bpm":   bpm
-        })
     
     # 3) control changes (pedals etc.)
     for cc in inst.control_changes:
@@ -41,7 +29,6 @@ def midi_to_event_list(midi_data):
             "type":       "control_change",
             "time":      cc.time,
             "controller": cc.number,  # MIDI controller number
-            "track":      track_idx,
             "value":      cc.value
         })
     
@@ -50,193 +37,155 @@ def midi_to_event_list(midi_data):
         events.append({
             "type":     "note",
             "time":    note.start,
-            "end_time":    note.end,
+            "duration":    note.end - note.start,
             "pitch":    note.pitch,
             "velocity": note.velocity
         })
     
     # Sort events by time
     events.sort(key=lambda x: x["time"])
+    
+     # 5) start-token with tempo info
+    times, tempi = midi_data.get_tempo_changes()  # times in sec, tempi in µs per beat
+    for t, uspb in zip(times, tempi):
+        bpm = 60_000_000 / uspb
+        events.insert(0, {  # insert at the start
+            "type":  "start-token",
+            "bpm":   bpm,
+            "resolution": midi_data.resolution  # ticks per beat
+        })
+        break  # only one start-token per file
+    
+    # 6) end-of-track marker
+    events.append({
+        "type": "end-token",
+        "time": midi_data.get_end_time(),  # end time of the track
+    })
+    
     return events
 
-from mido import MidiFile, MidiTrack, Message, MetaMessage
+import pretty_midi
 
-def events_to_midi(events, output_path='reconstructed.mid'):
+def events_to_midi(events, 
+                          output_path='reconstructed.mid'):
     """
-    Reconstruct a .mid from your event dicts, reading PPQN from the first token.
+    Reconstruct a .mid from your event dicts using PrettyMIDI.
 
-    events[0] must be:
-        {"type": "ticks_per_beat", "ticks_per_beat": <int>}
-
-    Subsequent events are dicts with keys:
-        - type: 'set_tempo', 'control_change', 'note', (optional 'patch_change')
-        - time: float seconds
-        For 'set_tempo':        'bpm'
-        For 'control_change':  'value' (and optionally 'controller', 'channel')
-        For 'note':            'pitch', 'velocity', 'end_time' (and optionally 'channel')
-        For 'patch_change':    'patch' (and optionally 'channel')
+    Expects:
+      - events[0] == {'type':'start-token','bpm':…, 'resolution':…}
+      - all other events have 'time' in seconds.
     """
-    # 0) Pull out PPQN from the first event
-    first = events[0]
-    if first.get("type") != "ticks_per_beat":
-        raise ValueError("First event must be a ticks_per_beat token")
-    ticks_per_beat = first["ticks_per_beat"]
-    payload = events[1:]  # the rest
+    if not events or events[0]['type'] != 'start-token':
+        raise ValueError("events[0] must be the start-token with 'bpm' & 'resolution'.")
 
-    # 1) Create type-1 MIDI with two tracks: meta & performance
-    mid = MidiFile(type=1)
-    mid.ticks_per_beat = ticks_per_beat
-    meta_track = MidiTrack(); perf_track = MidiTrack()
-    mid.tracks.append(meta_track)
-    mid.tracks.append(perf_track)
+    # 1) Pull out header info
+    start   = events[0]
+    resolution = int(start.get('resolution', 480))
+    bpm        = float(start.get('bpm', 120.0))
 
-    # 2) Expand events into mido‐ready messages
-    expanded = []
-    for e in payload:
-        t = e['time']
-        if e['type'] == 'note':
-            expanded.append({
-                'time':     t,
-                'kind':     'note_on',
-                'pitch':    e['pitch'],
-                'velocity': e['velocity'],
-                'channel':  e.get('channel', 0)
-            })
-            expanded.append({
-                'time':     e['end_time'],
-                'kind':     'note_off',
-                'pitch':    e['pitch'],
-                'velocity': 0,
-                'channel':  e.get('channel', 0)
-            })
-        elif e['type'] == 'set_tempo':
-            uspb = int(60_000_000 / e['bpm'])
-            expanded.append({'time': t, 'kind': 'set_tempo', 'tempo': uspb})
+    # 2) Create PrettyMIDI, set resolution & initial tempo
+    pm = pretty_midi.PrettyMIDI(resolution=resolution)
+    pm.initial_tempo = bpm
+
+    # 3) Build a single instrument (track 0)
+    inst = pretty_midi.Instrument(program=0)  # you can choose a different program if desired
+
+    # 4) Walk your events and append Notes / ControlChanges
+    for e in events[1:]:
+        t = float(e.get('time', 0.0))
+
+        if e['type'] == 'note' and e.get('pitch') is not None:
+            start_sec = t
+            end_sec   = t + float(e['duration'])
+            vel       = int(round(float(e['velocity']) * 127))
+            vel       = max(1, min(127, vel))  # avoid zero-velocity notes
+            note = pretty_midi.Note(
+                velocity=vel,
+                pitch=int(e['pitch']),
+                start=start_sec,
+                end=end_sec
+            )
+            inst.notes.append(note)
+
         elif e['type'] == 'control_change':
-            ctrl = e.get('controller', 64)
-            expanded.append({
-                'time':       t,
-                'kind':       'control_change',
-                'controller': ctrl,
-                'value':      e['value'],
-                'channel':    e.get('channel', 0)
-            })
-        elif e['type'] == 'patch_change':
-            expanded.append({
-                'time':    t,
-                'kind':    'program_change',
-                'program': e['patch'],
-                'channel': e.get('channel', 0)
-            })
+            cc_time = t
+            cc_num  = int(e.get('controller', 64))
+            cc_val  = int(round(float(e['value']) * 127))
+            cc_val  = max(0, min(127, cc_val))
+            ctrl = pretty_midi.ControlChange(
+                number=cc_num,
+                value=cc_val,
+                time=cc_time
+            )
+            inst.control_changes.append(ctrl)
 
-    # 3) Sort by time
-    expanded.sort(key=lambda x: x['time'])
+        # skip any other types (e.g. end-token)
 
-    # 4) Emit into tracks, converting seconds → ticks via current tempo
-    last_meta_time = 0.0
-    last_perf_time = 0.0
-    last_tempo_us  = None
-
-    for ev in expanded:
-        if ev['kind'] == 'set_tempo':
-            now = ev['time']
-            dt_sec = now - last_meta_time
-            dt_ticks = 0 if last_tempo_us is None else round(dt_sec * ticks_per_beat * 1e6 / last_tempo_us)
-            msg = MetaMessage('set_tempo', tempo=ev['tempo'], time=dt_ticks)
-            meta_track.append(msg)
-            last_meta_time = now
-            last_tempo_us  = ev['tempo']
-        else:
-            now = ev['time']
-            tempo_us = last_tempo_us or 500_000
-            dt_sec   = now - last_perf_time
-            dt_ticks = round(dt_sec * ticks_per_beat * 1e6 / tempo_us)
-
-            kind = ev['kind']
-            if kind == 'note_on':
-                msg = Message('note_on',
-                              note=ev['pitch'],
-                              velocity=ev['velocity'],
-                              time=dt_ticks,
-                              channel=ev['channel'])
-            elif kind == 'note_off':
-                msg = Message('note_off',
-                              note=ev['pitch'],
-                              velocity=ev['velocity'],
-                              time=dt_ticks,
-                              channel=ev['channel'])
-            elif kind == 'control_change':
-                msg = Message('control_change',
-                              control=ev['controller'],
-                              value=ev['value'],
-                              time=dt_ticks,
-                              channel=ev['channel'])
-            elif kind == 'program_change':
-                msg = Message('program_change',
-                              program=ev['program'],
-                              time=dt_ticks,
-                              channel=ev['channel'])
-            else:
-                continue
-
-            perf_track.append(msg)
-            last_perf_time = now
-
-    # 5) End‐of‐track markers
-    meta_track.append(MetaMessage('end_of_track', time=0))
-    perf_track.append(MetaMessage('end_of_track', time=0))
-
-    # 6) Save file
-    mid.save(output_path)
-    print(f"Reconstructed MIDI saved to: {output_path}")
-    return mid
-
-# utils.py
-
+    # 5) Append instrument and write file
+    pm.instruments.append(inst)
+    pm.write(output_path)
+    print(f"Wrote MIDI → {output_path}")
+    return pm
 
 def _events_to_features(events, dataset):
     """
-    Given a list of event‐dicts, produce a single‐item batch in the
+    Given a list of event-dicts, produce a single‐item batch in the
     exact same format that your Dataset/DataLoader collate_onehot emits.
     """
     last_t = 0.0
+    # temporary lists
     type_ids, pitch_ids, ctrl_ids = [], [], []
-    dts, durs, vals, bpms = [], [], [], []
+    
+    # delta times, durations, values
+    # values/durs are used for notes and control changes
+    # are are bpm / ticks per beat for start token
+    dts, durs, vals       = [], [], []
 
     for e in events:
-        # 1) time‐delta
-        dt = e["time"] - last_t
-        last_t = e["time"]
-        if dataset.time_bin:
-            dt = round(dt / dataset.time_bin) * dataset.time_bin
-        dts.append(dt)
+        if len(type_ids) >= dataset.max_seq_len:
+            break
+        # time delta
+        if "time" in e:
+            dt = e["time"] - last_t
+            last_t = e["time"]
+            if dataset.time_bin:
+                dt = round(dt / dataset.time_bin) * dataset.time_bin
+            dts.append(dt)
+        else:
+            dt = 0.0
+            dts.append(dt)
 
-        # 2) categorical slots
+        # categorical
         t_id = dataset.type2id[e["type"]]
         type_ids.append(t_id)
+        
+        assert t_id != "start-token", "Start token should not be in the event list from features."
 
+        
         if e["type"] == "note":
             pitch_ids.append(dataset.pitch2id[e["pitch"]])
             ctrl_ids.append(dataset.ctrl2id[None])
-            durs.append(e["end_time"] - e["time"])
-            vals.append(e["velocity"])
-            bpms.append(0.0)
-
+            durs.append(e["duration"])
+            vals.append(int(e["velocity"]) / 127.0)  # normalize velocity to [0, 1]
         elif e["type"] == "control_change":
             pitch_ids.append(dataset.pitch2id[None])
-            # map CC‐number to index
-            ctrl_ids.append(dataset.ctrl2id[e["controller"]])
+            ctrl_ids.append(dataset.ctrl2id[e["controller"]])  # <<— controller, not value
             durs.append(0.0)
-            vals.append(e["value"])
-            bpms.append(0.0)
-
-        else:  # set_tempo
+            vals.append(int(e["value"]) / 127.0)                         # <<— store the pedal pressure separately
+        elif e["type"] == "start-token":
             pitch_ids.append(dataset.pitch2id[None])
             ctrl_ids.append(dataset.ctrl2id[None])
-            durs.append(0.0)
-            vals.append(0.0)
-            bpms.append(e["bpm"])
-
+            durs.append(e["bpm"])  # store the bpm for start token
+            vals.append(e["resolution"])  # store the ticks per beat for start token
+        elif e["type"] == "end-token":
+            # end token does not have pitch or ctrl
+            pitch_ids.append(dataset.pitch2id[None])
+            ctrl_ids.append(dataset.ctrl2id[None])
+            durs.append(0.0)  # no duration for end token
+            vals.append(0.0)  # no value for end token
+        else:
+            raise ValueError(f"Unknown event type: {e['type']}")
+        
     # one‐hot encode categories
     type_oh  = F.one_hot(torch.tensor(type_ids),  num_classes=dataset.num_types).float()
     pitch_oh = F.one_hot(torch.tensor(pitch_ids), num_classes=dataset.num_pitches).float()
@@ -250,7 +199,6 @@ def _events_to_features(events, dataset):
         "dt":       torch.tensor(dts).unsqueeze(0),   # (1, L)
         "dur":      torch.tensor(durs).unsqueeze(0),  # (1, L)
         "val":      torch.tensor(vals).unsqueeze(0),  # (1, L)
-        "bpm":      torch.tensor(bpms).unsqueeze(0),  # (1, L)
         "lengths":  torch.tensor([len(dts)], dtype=torch.long)
     }
     return batch
@@ -272,9 +220,8 @@ def _sample_next_event(outputs, dataset, last_time):
     dt  = outputs["dt"][b,t].item()
     dur = outputs["dur"][b,t].item()
     val = outputs["val"][b,t].item()
-    bpm = outputs["bpm"][b,t].item()
-
-    next_time = last_time + dt
+    next_time = last_time + abs(dt)
+    dur = abs(dur)  # duration should be non-negative
 
     # reverse‐map IDs → strings/numbers
     # build reverse dicts once
@@ -285,63 +232,26 @@ def _sample_next_event(outputs, dataset, last_time):
     ev_type = id2type[type_id]
     if ev_type == "note":
         return {
-            "type":     "note",
-            "time":     next_time,
-            "end_time": next_time + dur,
-            "track":    0,
-            "duration": dur,
-            "channel":  0,
-            "pitch":    id2pitch[pitch_id],
-            "velocity": int(round(val))
+            "type":      "note",
+            "time":       next_time,
+            "duration":   dur,
+            "pitch":      id2pitch[pitch_id] if id2pitch[pitch_id] is not None else 60,  # default to middle C
+            "velocity":   int(round(min(max(val, 0.0), 1.0) * 127))
         }
     elif ev_type == "control_change":
         return {
             "type":       "control_change",
             "time":        next_time,
-            "track":       0,
-            "controller": id2ctrl[ctrl_id],
-            "value":       val
+            "controller": id2ctrl[ctrl_id] if id2ctrl[ctrl_id] is not None else 64,
+            "value":  int(round(min(max(val, 0.0), 1.0) * 127))
         }
-    else:  # set_tempo
+    elif ev_type == "start-token":
+        return None
+    elif ev_type == "end-token":
         return {
-            "type":  "set_tempo",
-            "time":   next_time,
-            "track":  0,
-            "bpm":    bpm
-        }
-
-def collate_onehot(batch):
-    """
-    Pads each field in the batch to shape (B, T_max, C) or (B, T_max)
-    """
-    B = len(batch)
-    Ls = [b["dt"].shape[0] for b in batch]
-    T = max(Ls)
-    out = {}
-
-    for key, tensor in batch[0].items():
-        if key == "ticks_per_beat":
-            # scalar: just return the first one
-            out[key] = tensor
-            continue
-        if tensor.dim() == 2:
-            # categorical one-hot: (L, C) -> (B, T, C)
-            _, C = tensor.shape
-            pad = torch.zeros(B, T, C, dtype=tensor.dtype)
-            for i, b in enumerate(batch):
-                L = b[key].shape[0]
-                pad[i, :L] = b[key]
-            out[key] = pad
-        else:
-            # continuous: (L,) -> (B, T)
-            pad = torch.zeros(B, T, dtype=tensor.dtype)
-            for i, b in enumerate(batch):
-                L = b[key].shape[0]
-                pad[i, :L] = b[key]
-            out[key] = pad
-
-    out["lengths"] = torch.tensor(Ls, dtype=torch.long)
-    return out
+            "type":       "end-token",
+            "time":        next_time
+            }
 
 def create_song(model, dataset, output_path, max_steps=500, device=None):
     """
@@ -358,44 +268,65 @@ def create_song(model, dataset, output_path, max_steps=500, device=None):
     device = device or torch.device("cpu")
     model.eval()
 
-    # 1) seed with ticks_per_beat from the first file in the manifest
+    # 1) seed with first event from the first file in the manifest
     row = dataset.df.iloc[0]
     pm  = pretty_midi.PrettyMIDI(os.path.join(dataset.midi_dir, row["midi_filename"]))
-    tpb = pm.resolution if hasattr(pm, "resolution") else pm.ticks_per_beat
-
-    events = [{"type":"ticks_per_beat","ticks_per_beat":tpb}]
+    ticks_per_beat = pm.resolution
+    events = midi_to_event_list(pm)
+    if not events:
+        raise ValueError("No events found in the MIDI file. Cannot generate song.")
+    
+    events = events[:1]  # start with the start token only
     last_time = 0.0
 
     # 2) autoregressive loop
-    for _ in range(max_steps):
+    for _ in tqdm(range(max_steps), desc="Generating example"):
         batch = _events_to_features(events, dataset)
-        batch = collate_onehot([batch])  # reuse your collate
+        # batch = collate_onehot([batch])  # reuse your collate
         # move to device
-        for k in batch: batch[k] = batch[k].to(device)
-
+        for k in batch: batch[k] = batch[k].float().to(device)
         # build model input exactly as in Train.py
         lengths = batch["lengths"] - 1
-        x_in = torch.cat([
-            batch["type_oh"] [:,:-1],
-            batch["pitch_oh"][:,:-1],
-            batch["ctrl_oh"] [:,:-1],
-            batch["dt"]     [:,:-1].unsqueeze(-1),
-            batch["dur"]    [:,:-1].unsqueeze(-1),
-            batch["val"]    [:,:-1].unsqueeze(-1),
-            batch["bpm"]    [:,:-1].unsqueeze(-1),
-        ], dim=2)
-
+        if lengths > 0:
+            x_in = torch.cat([
+                batch["type_oh"] [:,:-1],
+                batch["pitch_oh"][:,:-1],
+                batch["ctrl_oh"] [:,:-1],
+                batch["dt"]     [:,:-1].unsqueeze(-1),
+                batch["dur"]    [:,:-1].unsqueeze(-1),
+                batch["val"]    [:,:-1].unsqueeze(-1),
+            ], dim=2)
+        else:
+            x_in = torch.cat([
+                batch["type_oh"] ,
+                batch["pitch_oh"],
+                batch["ctrl_oh"],
+                batch["dt"].unsqueeze(-1),
+                batch["dur"].unsqueeze(-1),
+                batch["val"].unsqueeze(-1),
+            ], dim=2)
+            lengths = batch["lengths"]
         with torch.no_grad():
             out = model(x_in, lengths)
 
         # sample next event
         ev = _sample_next_event(out, dataset, last_time)
-        events.append(ev)
-        last_time = ev["time"]
+        if ev is not None:
+            events.append(ev)
+        
+            if "time" in ev:
+                # update last_time only if the event has a time field
+                last_time = ev["time"]
+            else:
+                last_time += 0.0  # no time update for start/end tokens
+        if ev and ev["type"] == "end-token":
+            print("End token reached, stopping generation.")
+            break
 
     # 3) write MIDI
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    print(f"Generated {len(events)} events, writing to {output_path}")
+    # For testing remove end-tokens
     events_to_midi(events, output_path=output_path)
 
 
-#%%
+##%%
